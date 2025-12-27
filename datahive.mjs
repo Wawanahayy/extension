@@ -1,4 +1,3 @@
-// bot.mjs
 import fs from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { setTimeout } from 'timers/promises';
@@ -14,7 +13,9 @@ const __dirname = path.dirname(__filename);
 const TOKEN_FILE = path.join(__dirname, 'token.txt');
 const DEVICES_DIR = path.join(__dirname, 'devices');
 
-// === FINGERPRINT DARI KAMU ===
+const DEVICE_PER_ACCOUNT = parseInt(process.env.DEVICE_PER_ACCOUNT, 10) || 1;
+
+// === FINGERPRINT ===
 const DESKTOP_USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.680.0 Safari/537.36',
@@ -157,7 +158,7 @@ const CPU_FINGERPRINTS = [
   ['AMD Ryzen 7 6800H with Radeon Graphics', '16', 'Windows 11']
 ];
 
-// Fungsi: pilih fingerprint berdasarkan deviceId (konsisten!)
+
 function getFingerprintFromDeviceId(deviceId) {
   const hash = deviceId.replace(/[^a-f0-9]/gi, '').substring(0, 8);
   const num = hash ? parseInt(hash, 16) : 0;
@@ -169,31 +170,57 @@ function getFingerprintFromDeviceId(deviceId) {
   };
 }
 
-// === FUNGSI UTAMA ===
-async function runSingleAccount(accountIndex) {
+// Dapatkan daftar device yang sudah ada untuk akun ini
+async function getExistingDevices(accountIndex) {
+  try {
+    const files = await fs.readdir(DEVICES_DIR);
+    return files
+      .filter(f => f.startsWith(`${accountIndex}-`) && f.endsWith('.id'))
+      .map(f => parseInt(f.split('-')[1], 10))
+      .filter(d => !isNaN(d))
+      .sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
+}
+
+// Baca atau buat device ID
+async function getOrCreateDeviceId(accountIndex, deviceIndex) {
+  await fs.mkdir(DEVICES_DIR, { recursive: true });
+  const deviceFile = path.join(DEVICES_DIR, `${accountIndex}-${deviceIndex}.id`);
+  try {
+    return (await fs.readFile(deviceFile, 'utf8')).trim();
+  } catch {
+    const newId = randomUUID();
+    await fs.writeFile(deviceFile, newId);
+    return newId;
+  }
+}
+
+async function runDevice(accountIndex, deviceIndex) {
+  const deviceId = await getOrCreateDeviceId(accountIndex, deviceIndex);
   const tokens = (await fs.readFile(TOKEN_FILE, 'utf8'))
     .split('\n')
     .map(t => t.trim())
     .filter(Boolean);
-  
+
   if (accountIndex > tokens.length) {
-    console.error(`[${accountIndex}] ❌ Tidak ada token`);
+    console.error(`[${accountIndex}-${deviceIndex}] ❌ Token tidak ada`);
     return;
   }
+
   const token = tokens[accountIndex - 1];
-
-  await fs.mkdir(DEVICES_DIR, { recursive: true });
-  const deviceIdPath = path.join(DEVICES_DIR, `${accountIndex}.id`);
-  let deviceId;
-  try {
-    deviceId = (await fs.readFile(deviceIdPath, 'utf8')).trim();
-  } catch {
-    deviceId = randomUUID();
-    await fs.writeFile(deviceIdPath, deviceId);
-  }
-
   const { userAgent, cpu } = getFingerprintFromDeviceId(deviceId);
   const [cpuModel, coreCount, osVersion] = cpu;
+
+  // Ambil dari .env
+  const BASE_URL = process.env.API_URL;
+  const EXTENSION_ORIGIN = process.env.EXTENSION_ORIGIN;
+
+  if (!BASE_URL || !EXTENSION_ORIGIN) {
+    console.error('❌ .env tidak lengkap! Butuh API_URL dan EXTENSION_ORIGIN');
+    process.exit(1);
+  }
 
   const headers = {
     accept: '*/*',
@@ -226,12 +253,10 @@ async function runSingleAccount(accountIndex) {
     'x-user-language': 'en-GB',
   };
 
-  const BASE_URL = process.env.HIVE_API_URL;
-
   function buildPingHeaders(baseHeaders) {
     return {
       ...baseHeaders,
-      origin: process.env.EXTENSION_ORIGIN,
+      origin: EXTENSION_ORIGIN,
       'content-length': '0',
     };
   }
@@ -261,46 +286,70 @@ async function runSingleAccount(accountIndex) {
     await makeRequest(id, 'GET', '/job', hdrs);
   }
 
+  const id = `${accountIndex}-${deviceIndex}`;
   const startJitter = Math.floor(Math.random() * 5000);
   await setTimeout(startJitter);
 
-  console.log(`[${accountIndex}] 🚀 Mulai (delay awal: ${startJitter}ms)`);
-  console.log(`[${accountIndex}] 🆔 Device ID: ${deviceId}`);
-  console.log(`[${accountIndex}] 🖥️  CPU: ${cpuModel}`);
-  console.log(`[${accountIndex}] 🌐 OS: ${osVersion}`);
+  console.log(`[${id}] 🚀 Mulai (delay: ${startJitter}ms)`);
+  console.log(`[${id}] 🆔 Device ID: ${deviceId}`);
 
   while (true) {
-    await runCycle(accountIndex, headers);
-    const interval = 28_000 + Math.floor(Math.random() * 4000); // 28–32 detik
+    await runCycle(id, headers);
+    const interval = 28_000 + Math.floor(Math.random() * 4000);
     await setTimeout(interval);
   }
 }
 
 // === MAIN ===
 async function main() {
-  const args = process.argv.slice(2);
   const tokens = (await fs.readFile(TOKEN_FILE, 'utf8'))
     .split('\n')
     .map(t => t.trim())
     .filter(Boolean);
 
-  if (args.length === 0) {
-    if (tokens.length === 0) {
-      console.error('❌ token.txt kosong');
-      process.exit(1);
-    }
-    console.log(`🚀 Menjalankan ${tokens.length} akun...`);
-    for (let i = 1; i <= tokens.length; i++) {
-      spawn(process.execPath, [__filename, i.toString()], { stdio: 'inherit' });
-    }
-  } else {
-    const idx = parseInt(args[0], 10);
-    if (!idx || idx <= 0 || idx > tokens.length) {
-      console.error('❌ Akun tidak valid');
-      process.exit(1);
-    }
-    await runSingleAccount(idx);
+  if (tokens.length === 0) {
+    console.error('❌ token.txt kosong');
+    process.exit(1);
   }
+
+
+  for (let acc = 1; acc <= tokens.length; acc++) {
+    const existing = await getExistingDevices(acc);
+    if (existing.length === 0) {
+
+      for (let dev = 1; dev <= DEVICE_PER_ACCOUNT; dev++) {
+        await getOrCreateDeviceId(acc, dev);
+      }
+      console.log(`📦 Akun ${acc}: buat ${DEVICE_PER_ACCOUNT} device`);
+    } else {
+      console.log(`📦 Akun ${acc}: sudah ada ${existing.length} device`);
+    }
+  }
+
+  const processes = [];
+  for (let acc = 1; acc <= tokens.length; acc++) {
+    const existing = await getExistingDevices(acc);
+    const deviceCount = Math.min(existing.length, DEVICE_PER_ACCOUNT);
+    for (let i = 0; i < deviceCount; i++) {
+      const devIndex = existing[i];
+      const child = spawn(process.execPath, [__filename, acc.toString(), devIndex.toString()], {
+        stdio: 'inherit'
+      });
+      processes.push(child);
+    }
+  }
+
+  console.log(`🚀 Menjalankan ${processes.length} device dari ${tokens.length} akun`);
 }
 
-main().catch(console.error);
+if (process.argv.length === 4) {
+  const acc = parseInt(process.argv[2], 10);
+  const dev = parseInt(process.argv[3], 10);
+  if (!isNaN(acc) && !isNaN(dev)) {
+    runDevice(acc, dev).catch(console.error);
+  } else {
+    process.exit(1);
+  }
+} else {
+  main().catch(console.error);
+}
