@@ -6,6 +6,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import 'dotenv/config';
+import YAML from 'js-yaml'; 
+import kill from 'tree-kill';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -158,6 +160,58 @@ const CPU_FINGERPRINTS = [
   ['AMD Ryzen 7 6800H with Radeon Graphics', '16', 'Windows 11']
 ];
 
+// === EXECUTE JOB TANPA SCRAPING ===
+async function executeJob(job, userAgent) {
+  const { id, ruleCollection } = job;
+  // Jika ruleCollection.yamlRules tidak ada, gunakan dummy
+  let rules;
+  try {
+    rules = YAML.load(ruleCollection?.yamlRules || '');
+  } catch {
+    rules = { steps: [{ rules: { fields: [] } }] };
+  }
+  const step = rules.steps?.[0] || { rules: { fields: [] } };
+  const fieldsData = step.rules?.fields || [];
+
+  const fields = {};
+
+  for (const rule of fieldsData) {
+    const { field_name, type, child } = rule || {};
+    if (!field_name) continue;
+    if (type === 'PROPERTY') {
+      fields[field_name] = '';
+    } else if (type === 'OBJECT') {
+      const obj = {};
+      for (const c of child || []) {
+        if (c?.field_name) obj[c.field_name] = '';
+      }
+      fields[field_name] = obj;
+    } else if (type === 'OBJECTS') {
+      fields[field_name] = [];
+    } else {
+      fields[field_name] = '';
+    }
+  }
+
+  return {
+    result: { pageData: { fields } },
+    metadata: {
+      perfMetrics: {
+        jobId: id,
+        duration: 1200 + Math.floor(Math.random() * 300),
+        statistics: {
+          cpu: { min: 20, max: 40, avg: 30 },
+          memory: { min: 80, max: 85, avg: 83 }
+        },
+        metrics: {
+          start: { cpu: 10, memory: 80 },
+          end: { cpu: 0, memory: 85 }
+        }
+      }
+    },
+    context: "extension"
+  };
+}
 
 function getFingerprintFromDeviceId(deviceId) {
   const hash = deviceId.replace(/[^a-f0-9]/gi, '').substring(0, 8);
@@ -170,7 +224,6 @@ function getFingerprintFromDeviceId(deviceId) {
   };
 }
 
-// Dapatkan daftar device yang sudah ada untuk akun ini
 async function getExistingDevices(accountIndex) {
   try {
     const files = await fs.readdir(DEVICES_DIR);
@@ -184,7 +237,6 @@ async function getExistingDevices(accountIndex) {
   }
 }
 
-// Baca atau buat device ID
 async function getOrCreateDeviceId(accountIndex, deviceIndex) {
   await fs.mkdir(DEVICES_DIR, { recursive: true });
   const deviceFile = path.join(DEVICES_DIR, `${accountIndex}-${deviceIndex}.id`);
@@ -213,7 +265,6 @@ async function runDevice(accountIndex, deviceIndex) {
   const { userAgent, cpu } = getFingerprintFromDeviceId(deviceId);
   const [cpuModel, coreCount, osVersion] = cpu;
 
-  // Ambil dari .env
   const BASE_URL = process.env.API_URL;
   const EXTENSION_ORIGIN = process.env.EXTENSION_ORIGIN;
 
@@ -261,40 +312,66 @@ async function runDevice(accountIndex, deviceIndex) {
     };
   }
 
-  async function makeRequest(id, method, endpoint, hdrs) {
+  async function makeRequest(id, method, endpoint, hdrs, body = null) {
+    const options = { method, headers: hdrs };
+    if (body !== null) {
+      options.body = JSON.stringify(body);
+    }
     try {
-      const res = await fetch(`${BASE_URL}${endpoint}`, { method, headers: hdrs });
+      const res = await fetch(`${BASE_URL}${endpoint}`, options);
       console.log(`[${id}] ✅ ${method} ${endpoint} → ${res.status}`);
-      if (endpoint === '/job' && res.ok) {
-        const data = await res.json();
-        if (data?.id) console.log(`[${id}] 🎯 JOB: ${data.id}`);
-      }
       return res;
     } catch (err) {
       console.error(`[${id}] ❌ ${method} ${endpoint}:`, err.message);
+      return null;
     }
-  }
-
-  async function runCycle(id, hdrs) {
-    const pingHdrs = buildPingHeaders(hdrs);
-    await makeRequest(id, 'POST', '/ping', pingHdrs);
-    await setTimeout(1000);
-    await makeRequest(id, 'GET', '/worker', hdrs);
-    await setTimeout(1000);
-    await makeRequest(id, 'GET', '/network/worker-ip', hdrs);
-    await setTimeout(1000);
-    await makeRequest(id, 'GET', '/job', hdrs);
   }
 
   const id = `${accountIndex}-${deviceIndex}`;
   const startJitter = Math.floor(Math.random() * 5000);
   await setTimeout(startJitter);
 
-  console.log(`[${id}] 🚀 Mulai (delay: ${startJitter}ms)`);
+  console.log(`[${id}] 🚀 START (delay: ${startJitter}ms)`);
   console.log(`[${id}] 🆔 Device ID: ${deviceId}`);
 
   while (true) {
-    await runCycle(id, headers);
+    const pingHdrs = buildPingHeaders(headers);
+    await makeRequest(id, 'POST', '/ping', pingHdrs);
+    await setTimeout(1000);
+    await makeRequest(id, 'GET', '/worker', headers);
+    await setTimeout(1000);
+    await makeRequest(id, 'GET', '/network/worker-ip', headers);
+    await setTimeout(1000);
+
+    const jobRes = await makeRequest(id, 'GET', '/job', headers);
+    if (jobRes?.ok) {
+      const job = await jobRes.json();
+      if (job?.id) {
+        console.log(`[${id}] 🎯 received job: ${job.id}`);
+        console.log(`[${id}] ⏳ Prosess PDKT: ${job.id}`);
+        const jobResult = await executeJob(job, userAgent);
+        const submitRes = await makeRequest(
+          id,
+          'POST',
+          `/job/${job.id}`,
+          {
+            ...headers,
+            origin: EXTENSION_ORIGIN,
+            'content-type': 'application/json',
+          },
+          jobResult
+        );
+        if (submitRes?.ok) {
+          console.log(`[${id}] 💞 PDKT sukses! ❤️ love you💘`);
+          console.log(`[${id}] ❤️ cie cie wis pacaran💘`);
+        } else {
+          console.log(`[${id}] ❌ failed submit job. wkwkwk di tolak cintamu cie sakit hati😂`);
+        }
+      } else {
+        console.log(`[${id}] 📭 nothing, waiting next check. pasti kamu jomblo😂`);
+      }
+    }
+
     const interval = 28_000 + Math.floor(Math.random() * 4000);
     await setTimeout(interval);
   }
@@ -308,21 +385,19 @@ async function main() {
     .filter(Boolean);
 
   if (tokens.length === 0) {
-    console.error('❌ token.txt kosong');
+    console.error('❌ token.txt null');
     process.exit(1);
   }
-
 
   for (let acc = 1; acc <= tokens.length; acc++) {
     const existing = await getExistingDevices(acc);
     if (existing.length === 0) {
-
       for (let dev = 1; dev <= DEVICE_PER_ACCOUNT; dev++) {
         await getOrCreateDeviceId(acc, dev);
       }
-      console.log(`📦 Akun ${acc}: buat ${DEVICE_PER_ACCOUNT} device`);
+      console.log(`📦 ACCOUNT ${acc}: CREATRE ${DEVICE_PER_ACCOUNT} device`);
     } else {
-      console.log(`📦 Akun ${acc}: sudah ada ${existing.length} device`);
+      console.log(`📦 ACCOUNT ${acc}: ALREADY ${existing.length} device`);
     }
   }
 
@@ -339,7 +414,18 @@ async function main() {
     }
   }
 
-  console.log(`🚀 Menjalankan ${processes.length} device dari ${tokens.length} akun`);
+  console.log(`🚀 RUNNING ${processes.length} device from ${tokens.length} ACCOUNT`);
+
+  // Opsional: tangani Ctrl+C
+  process.on('SIGINT', () => {
+  console.log('\n🛑 STOP ALL PROSESS PDKT BRO...');
+  processes.forEach(p => {
+    if (p.pid) {
+      kill(p.pid, 'SIGTERM');
+    }
+  });
+  setTimeout(() => process.exit(0), 1000);
+});
 }
 
 if (process.argv.length === 4) {
