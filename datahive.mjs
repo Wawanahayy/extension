@@ -8,11 +8,14 @@ import { spawn } from 'child_process';
 import 'dotenv/config';
 import YAML from 'js-yaml'; 
 import kill from 'tree-kill';
+import { HttpsProxyAgent } from 'https-proxy-agent';
+import { SocksProxyAgent } from 'socks-proxy-agent'; // ← Dukungan SOCKS5
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const TOKEN_FILE = path.join(__dirname, 'token.txt');
+const PROXY_FILE = path.join(__dirname, 'proxies.txt');
 const DEVICES_DIR = path.join(__dirname, 'devices');
 
 const DEVICE_PER_ACCOUNT = parseInt(process.env.DEVICE_PER_ACCOUNT, 10) || 1;
@@ -160,10 +163,57 @@ const CPU_FINGERPRINTS = [
   ['AMD Ryzen 7 6800H with Radeon Graphics', '16', 'Windows 11']
 ];
 
+// === PROXY SESSION + AGENT DUKUNGAN SEMUA JENIS ===
+async function getStickyProxyForAccount(accountIndex) {
+  try {
+    const proxies = (await fs.readFile(PROXY_FILE, 'utf8'))
+      .split('\n')
+      .map(p => p.trim())
+      .filter(p => p && !p.startsWith('#'));
+
+    if (proxies.length === 0) return null;
+
+    const proxyBase = proxies[(accountIndex - 1) % proxies.length];
+    const url = new URL(proxyBase);
+    const username = decodeURIComponent(url.username);
+    const password = decodeURIComponent(url.password);
+    const host = url.hostname;
+    const port = url.port || (url.protocol.includes('https') ? '443' : '3128');
+    const protocol = url.protocol.replace(/:$/, ''); // 'http', 'https', 'socks5', dll.
+
+    const sessionName = `account${accountIndex}`;
+    const stickyUsername = `${username}-session-${sessionName}`;
+
+    return `${protocol}://${stickyUsername}:${password}@${host}:${port}`;
+  } catch (err) {
+    console.error(`[${accountIndex}] ❌ Proxy error:`, err.message);
+    return null;
+  }
+}
+
+// === BUAT FETCH DENGAN AGENT YANG SESUAI ===
+function createProxiedFetch(proxyUrl) {
+  if (!proxyUrl) return fetch;
+
+  const url = new URL(proxyUrl);
+  const protocol = url.protocol.replace(/:$/, '');
+
+  let agent;
+  if (protocol === 'http' || protocol === 'https') {
+    agent = new HttpsProxyAgent(proxyUrl);
+  } else if (protocol === 'socks5' || protocol === 'socks5h' || protocol === 'socks4') {
+    agent = new SocksProxyAgent(proxyUrl);
+  } else {
+    console.warn(`⚠️ Unsupported proxy protocol: ${protocol}`);
+    return fetch;
+  }
+
+  return (targetUrl, options = {}) => fetch(targetUrl, { ...options, agent });
+}
+
 // === EXECUTE JOB TANPA SCRAPING ===
 async function executeJob(job, userAgent) {
   const { id, ruleCollection } = job;
-  // Jika ruleCollection.yamlRules tidak ada, gunakan dummy
   let rules;
   try {
     rules = YAML.load(ruleCollection?.yamlRules || '');
@@ -174,7 +224,6 @@ async function executeJob(job, userAgent) {
   const fieldsData = step.rules?.fields || [];
 
   const fields = {};
-
   for (const rule of fieldsData) {
     const { field_name, type, child } = rule || {};
     if (!field_name) continue;
@@ -249,6 +298,7 @@ async function getOrCreateDeviceId(accountIndex, deviceIndex) {
   }
 }
 
+// === RUN DEVICE ===
 async function runDevice(accountIndex, deviceIndex) {
   const deviceId = await getOrCreateDeviceId(accountIndex, deviceIndex);
   const tokens = (await fs.readFile(TOKEN_FILE, 'utf8'))
@@ -271,6 +321,14 @@ async function runDevice(accountIndex, deviceIndex) {
   if (!BASE_URL || !EXTENSION_ORIGIN) {
     console.error('❌ .env tidak lengkap! Butuh API_URL dan EXTENSION_ORIGIN');
     process.exit(1);
+  }
+
+  const proxyUrl = await getStickyProxyForAccount(accountIndex);
+  const proxiedFetch = createProxiedFetch(proxyUrl);
+
+  if (proxyUrl) {
+    const cleanProxy = proxyUrl.replace(/\/\/[^@]+@/, '//***:***@');
+    console.log(`[${accountIndex}-${deviceIndex}] 🌐 Proxy: ${cleanProxy}`);
   }
 
   const headers = {
@@ -318,7 +376,7 @@ async function runDevice(accountIndex, deviceIndex) {
       options.body = JSON.stringify(body);
     }
     try {
-      const res = await fetch(`${BASE_URL}${endpoint}`, options);
+      const res = await proxiedFetch(`${BASE_URL}${endpoint}`, options);
       console.log(`[${id}] ✅ ${method} ${endpoint} → ${res.status}`);
       return res;
     } catch (err) {
@@ -395,7 +453,7 @@ async function main() {
       for (let dev = 1; dev <= DEVICE_PER_ACCOUNT; dev++) {
         await getOrCreateDeviceId(acc, dev);
       }
-      console.log(`📦 ACCOUNT ${acc}: CREATRE ${DEVICE_PER_ACCOUNT} device`);
+      console.log(`📦 ACCOUNT ${acc}: CREATE ${DEVICE_PER_ACCOUNT} device`);
     } else {
       console.log(`📦 ACCOUNT ${acc}: ALREADY ${existing.length} device`);
     }
@@ -416,16 +474,15 @@ async function main() {
 
   console.log(`🚀 RUNNING ${processes.length} device from ${tokens.length} ACCOUNT`);
 
-  // Opsional: tangani Ctrl+C
   process.on('SIGINT', () => {
-  console.log('\n🛑 STOP ALL PROSESS PDKT BRO...');
-  processes.forEach(p => {
-    if (p.pid) {
-      kill(p.pid, 'SIGTERM');
-    }
+    console.log('\n🛑 STOP ALL PROSESS PDKT BRO...');
+    processes.forEach(p => {
+      if (p.pid) {
+        kill(p.pid, 'SIGTERM');
+      }
+    });
+    setTimeout(() => process.exit(0), 1000);
   });
-  setTimeout(() => process.exit(0), 1000);
-});
 }
 
 if (process.argv.length === 4) {
